@@ -77,6 +77,8 @@ module exe_stage(
     wire [31:0] imm_B;
     wire [31:0] imm_J;
     wire [31:0] imm_I;
+    wire        exe_is_ret_from_id;
+    wire [2:0]  exe_safe_ras_ptr;
     reg [`ID_TO_EXE_BUS_WIDTH-1:0] exe_reg;
 
     always @(posedge clk) begin
@@ -121,7 +123,9 @@ module exe_stage(
             pre_index,         //6
             imm_B,            //32
             imm_J,            //32
-            imm_I             //32
+            imm_I,            //32
+            exe_is_ret_from_id,   //1
+            exe_safe_ras_ptr       //3
         } = exe_reg;
     
 
@@ -140,9 +144,10 @@ module exe_stage(
         pre_index,
         exe_tag,
         exe_taken,
-        exe_is_ret
+        exe_is_ret,
+        exe_safe_ras_ptr
     };
-    //位宽是1+32+1+6+15+1+1=57
+    //位宽是1+32+1+6+15+1+1 +3 =60
 
     //output bus to id stage
 
@@ -219,10 +224,10 @@ module exe_stage(
     assign flush_en = ((exe_taken != pre_taken) || (exe_taken && (br_target != pre_target)))
                       && exe_valid;   
     assign exe_we = (inst_beq | inst_bne | inst_blt | inst_bge | inst_bltu | inst_bgeu | inst_jal | inst_jalr)
-                                  && exe_valid;
+                                  && exe_valid && exe_ready_go;
 
     assign exe_tag      = exe_pc[22:8]; 
-    assign exe_is_ret = inst_jalr && (exe_reg_waddr == 5'b0); 
+    assign exe_is_ret = exe_is_ret_from_id;
     //这一大段代码什么意思，详细解释一下？
 
 

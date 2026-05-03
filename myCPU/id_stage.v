@@ -51,7 +51,8 @@ module id_stage(
     wire        pre_taken;
     wire [31:0] pre_target;
     wire [5:0]  pre_index;
-    assign {id_pc, id_inst, pre_taken, pre_target, pre_index} = id_reg;//输入
+    wire [2:0]  current_ras_ptr;// 用于拆出 IF 传过来的快照
+    assign {id_pc, id_inst, pre_taken, pre_target, pre_index, current_ras_ptr} = id_reg;//输入
 
 
     /*..........input bus from WB stage..............*/
@@ -143,9 +144,15 @@ module id_stage(
         inst_jal,  
         inst_jalr,  
         pre_taken, pre_target, pre_index,
-        imm_B, imm_J, imm_I
+        imm_B, imm_J, imm_I,
+        id_is_ret,
+        id_safe_ras_ptr
     };
-//位宽: 32 + 12 + 1 + 1 + 1 + 1 + 4 + 1 + 5 + 32 + 32 + 32 +8+ 8+1+32+6+96 = 305
+    // 如果我是函数调用(id_push_ras)，我的合法未来就是初始快照+1；否则就是初始快照原样
+    wire [2:0] id_safe_ras_ptr = id_push_ras ? (current_ras_ptr + 3'b1) : current_ras_ptr;
+
+    wire id_is_ret = inst_jalr && is_link_reg_rs1 && (rd != rs1);//函数返回指令标志，用于exe阶段给 BTB 更新
+    //位宽: 32 + 12 + 1 + 1 + 1 + 1 + 4 + 1 + 5 + 32 + 32 + 32 +8+ 8+1+32+6+96+ 1 + 3 = 309
 
 
     /*...........output bus to if stage (RAS 维护).............*/
@@ -157,6 +164,7 @@ module id_stage(
     
     // RAS 出栈条件：是函数返回指令ret (jalr，源寄存器rs1是 x1 或 x5），且 rd != rs1，且这是一条有效的指令
     wire id_pop_ras  = inst_jalr && is_link_reg_rs1 && (rd != rs1) && id_valid && !flush_en;
+
     
     // RAS 入栈数据：函数调用指令的下一条指令地址 (PC + 4)
     wire [31:0] id_ras_wdata = id_pc + 32'h4;

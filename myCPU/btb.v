@@ -39,8 +39,15 @@ module btb #(
     input  wire [TAG_LEN-1:0]   exe_tag,   // 这条指令的真实身份标签 (tag匹配错误的时候修正)
     input  wire        exe_is_ret,   // 这条指令到底是不是 jalr 函数返回指令？
     input  wire        exe_taken,    // EXE 级算出的真实方向 (1为跳，0为不跳)
-    input  wire [31:0] exe_target    // EXE 级算出的真实目标地址 (预测没跳实际跳了或预测跳了实际没跳时需要修正)
+    input  wire [31:0] exe_target,    // EXE 级算出的真实目标地址 (预测没跳实际跳了或预测跳了实际没跳时需要修正)
     /*==========================================================*/
+
+
+
+    // ========== 【新增：后悔药机制端口】 ==========
+    output wire [2:0] current_ras_ptr,      // 吐出当前真实的指针给 IF 阶段
+    input  wire       flush_en,         // 接收 EXE 阶段的清空警告 (出错啦！)
+    input  wire [2:0] exe_restore_ras_ptr   // 接收 EXE 阶段扔回来的后悔药
 );
 
    
@@ -59,6 +66,8 @@ module btb #(
     reg [2:0]  ras_ptr;         // 一个 3二进制位 的环形指针(范围0~7)，永远指向栈内下一个可以写入的空白行。
     /*==========================================================*/
 
+    // 【修改1：直接用导线把内部指针接出去，让外部随时可见】
+    assign current_ras_ptr = ras_ptr;
 
 
     /*IF 阶段预测逻辑 (纯零延迟组合逻辑)*/
@@ -97,16 +106,19 @@ module btb #(
     always @(posedge clk) begin
         if (reset) begin
             ras_ptr <= 3'b0; // 复位时，指针指向第0行。
-        end else begin
-            if (id_push_ras) begin
+
+        end else if (flush_en) begin// --- 新增：最高优先级！一旦EXE发现走错了，强行覆盖指针 
+            ras_ptr <= exe_restore_ras_ptr; // 管家吃下后悔药，指针瞬间恢复
+
+        end else if (id_push_ras) begin
                 // 把紧跟着函数调用指令的下一条指令(PC+4)塞进正在指向的空行。
                 ras_stack[ras_ptr] <= id_ras_wdata;
                 // 指针上移一格，指向下一个空位。
                 ras_ptr <= ras_ptr + 1'b1;
-            end else if (id_pop_ras) begin
+        end else if (id_pop_ras) begin
                 // 函数运行完毕开始返回。指针下退一格，代表刚刚那个返回地址已经被用掉并且作废了。
                 ras_ptr <= ras_ptr - 1'b1;
-            end
+            
         end
     end
     /*==========================================================*/

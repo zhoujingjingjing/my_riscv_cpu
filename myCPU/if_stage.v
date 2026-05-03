@@ -20,6 +20,39 @@ module if_stage (
 );
 
 
+// output bus to ID stage
+    reg  [31:0] if_pc;
+    wire [31:0] inst;
+
+    wire        pre_taken;
+    wire [31:0] pre_target;
+    wire [5:0]  pre_index;
+    wire        pre_is_ret;
+    assign if_to_id_bus = {if_pc, inst, pre_taken, pre_target, pre_index, current_ras_ptr};
+    //位宽: 32 + 32 + 1 + 32 + 6 += 106
+
+    // input bus from EXE (for branch flush and BTB update)
+    wire        flush_en;
+    wire        exe_we;  
+    wire [5:0]  exe_index; 
+    wire [14:0] exe_tag;
+    wire        exe_taken; 
+    wire [31:0] exe_target;   
+    wire        exe_is_ret;  
+
+    wire [2:0] current_ras_ptr;     // 接住 btb 吐出的当前指针
+    wire [2:0] exe_restore_ras_ptr; // 接住 exe 传回来的后悔药
+
+    assign {flush_en, exe_target, exe_we, exe_index, exe_tag, exe_taken, exe_is_ret, exe_restore_ras_ptr} = exe_to_if_bus;
+
+    // [新增] input bus from ID (for RAS maintenance)
+    wire        id_push_ras;
+    wire        id_pop_ras;
+    wire [31:0] id_ras_wdata;
+    assign {id_push_ras, id_pop_ras, id_ras_wdata} = id_to_if_bus;
+
+
+
 // BTB 预测模块实例化 
 btb # (
     .INDEX_LEN(6),
@@ -44,38 +77,15 @@ btb # (
     .exe_tag(exe_tag),
     .exe_is_ret(exe_is_ret),
     .exe_taken(exe_taken),
-    .exe_target(exe_target)
+    .exe_target(exe_target),
+
+    .current_ras_ptr     (current_ras_ptr),     
+    .flush_en            (flush_en),       
+    .exe_restore_ras_ptr (exe_restore_ras_ptr)
   );
 
 
-// output bus to ID stage
-    reg  [31:0] if_pc;
-    wire [31:0] inst;
 
-    wire        pre_taken;
-    wire [31:0] pre_target;
-    wire [5:0]  pre_index;
-    wire        pre_is_ret;
-    assign if_to_id_bus = {if_pc, inst, pre_taken, pre_target, pre_index};
-    //位宽: 32 + 32 + 1 + 32 + 6 = 103
-
-    // input bus from EXE (for branch flush and BTB update)
-    wire        flush_en;
-    wire        exe_we;  
-    wire [5:0]  exe_index; 
-    wire [14:0] exe_tag;
-    wire        exe_taken; 
-    wire [31:0] exe_target;   
-    wire        exe_is_ret;   
-      
-    assign {flush_en, exe_target, exe_we, exe_index, exe_tag, exe_taken, exe_is_ret} = exe_to_if_bus;
-
-    // [新增] input bus from ID (for RAS maintenance)
-    // 请确保 if_stage.v 的模块端口列表里有 : input wire [`ID_TO_IF_BUS_WIDTH-1:0] id_to_if_bus
-    wire        id_push_ras;
-    wire        id_pop_ras;
-    wire [31:0] id_ras_wdata;
-    assign {id_push_ras, id_pop_ras, id_ras_wdata} = id_to_if_bus;
 
     /*......pipeline control.......*/
 
@@ -99,8 +109,8 @@ btb # (
     always @(posedge clk) begin
         if (reset) begin
             if_valid <= 1'b0;
-         end else if (flush_en) begin
-            if_valid <= 1'b0;  
+        //  end else if (flush_en) begin
+        //     if_valid <= 1'b0;  
         end else if (if_allow_in) begin                
             if_valid <= ~reset;
         end
