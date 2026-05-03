@@ -29,7 +29,7 @@ module counter(
     output logic [31:0]  perip_rdata
 );
 
-    logic [15:0] cnt_1ms;
+    logic [17:0] cnt_1ms;
     logic [31:0] cnt_ms;
     logic start;
 
@@ -47,7 +47,7 @@ module counter(
         if (rst) begin
             cnt_1ms <= 0;
         end else if (start) begin
-            if (cnt_1ms == 49999) begin
+            if (cnt_1ms == 179999) begin
                 cnt_1ms <= 0;
             end else begin
                 cnt_1ms <= cnt_1ms + 1;
@@ -57,10 +57,10 @@ module counter(
         end
     end
 
-    always_ff @(posedge clk) begin
+    always_ff @(posedge clk) begin  
         if (rst) begin
             cnt_ms <= 0;
-        end else if (start && cnt_1ms == 49999) begin
+        end else if (start && cnt_1ms == 179999) begin
             cnt_ms <= cnt_ms + 1;
         end
     end

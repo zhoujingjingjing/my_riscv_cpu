@@ -4,7 +4,7 @@ module id_stage(
     input wire reset,
 
     output wire [`ID_TO_EXE_BUS_WIDTH-1:0] id_to_exe_bus,//bus to EXE stage
-    output wire [`ID_TO_IF_BUS_WIDTH-1:0]  id_to_if_bus, //bus to IF stage (for branch)
+    output wire [`ID_TO_IF_BUS_WIDTH-1:0] id_to_if_bus, //bus to IF stage (for RAS maintenance)
     input  wire [`IF_TO_ID_BUS_WIDTH-1:0]  if_to_id_bus, //bus from IF stage
     input wire  [`WB_TO_ID_BUS_WIDTH-1:0]  wb_to_id_bus, //bus from WB stage(for regfile and bypass)
     input wire  [`EXE_TO_ID_BYPASS_BUS_WIDTH-1:0]    exe_to_id_bypass_bus, //bus from EXE stage for bypass
@@ -24,11 +24,10 @@ module id_stage(
     wire id_ready_go;
     reg  id_valid;
     reg [`IF_TO_ID_BUS_WIDTH-1:0] id_reg;
-    wire br_cancel;
     always @ (posedge clk) begin
         if (reset) begin
             id_valid <= 1'b0;
-        end else if (br_cancel) begin
+        end else if (flush_en) begin //这里加flush_en干什么？
             id_valid <= 1'b0;//如果分支跳转了，那么就把id_stage的指令作废了，变成气泡    
         end else if (id_allow_in) begin
             id_valid <= if_to_id_valid;
@@ -37,7 +36,7 @@ module id_stage(
 
     // assign id_ready_go = 1'b1;
     assign id_allow_in = ~id_valid || id_ready_go && exe_allow_in;
-    assign id_to_exe_valid = id_valid && id_ready_go;
+    assign id_to_exe_valid = id_valid && id_ready_go && !flush_en;
 
   /*............input bus from IF stage.............*/
     always @(posedge clk) begin
@@ -46,9 +45,13 @@ module id_stage(
         end
     end
 
-    wire  [31:0] id_pc;
+    wire [31:0] id_pc;
     wire [31:0] id_inst;
-    assign {id_pc, id_inst} = id_reg;//输入
+
+    wire        pre_taken;
+    wire [31:0] pre_target;
+    wire [5:0]  pre_index;
+    assign {id_pc, id_inst, pre_taken, pre_target, pre_index} = id_reg;//输入
 
 
     /*..........input bus from WB stage..............*/
@@ -64,7 +67,8 @@ module id_stage(
     wire [4:0] exe_rf_waddr;
     wire [31:0] exe_rf_wdata;
     wire exe_is_load;//exe阶段的指令是否是load指令，这个信号是为了在ID阶段判断是否有load-use冒险
-    assign {exe_valid, exe_rf_we, exe_rf_waddr, exe_rf_wdata, exe_is_load} = exe_to_id_bypass_bus;
+    wire flush_en;
+    assign {exe_valid, exe_rf_we, exe_rf_waddr, exe_rf_wdata, exe_is_load, flush_en} = exe_to_id_bypass_bus;
 
     /*..........input bus from mem stage..............*/
     wire mem_valid;
@@ -73,11 +77,6 @@ module id_stage(
     wire [31:0] mem_rf_wdata;
     assign {mem_valid, mem_rf_we, mem_rf_waddr, mem_rf_wdata} = mem_to_id_bypass_bus;
 
-
-    /*...........output bus to if stage.............*/
-    wire        br_taken;
-    wire [31:0] br_target;
-    assign id_to_if_bus = {br_taken, br_target};//输出
 
 
     /*............output bus to EXE stage.............*/
@@ -103,6 +102,15 @@ module id_stage(
     wire        inst_sb;
     wire        inst_sh;
     wire        inst_sw;
+    //送到EXE阶段的分支判定信号
+    wire inst_beq;
+    wire inst_bne;
+    wire inst_blt;
+    wire inst_bge;
+    wire inst_bltu;
+    wire inst_bgeu;
+    wire inst_jal;
+    wire inst_jalr;
 
     assign id_to_exe_bus = {
         id_pc,
@@ -124,10 +132,37 @@ module id_stage(
         inst_lhu, // 新增
         inst_sb,  // 新增
         inst_sh,  // 新增
-        inst_sw   // 新增           
+        inst_sw,  // 新增      
+        
+        inst_beq,  
+        inst_bne,  
+        inst_blt, 
+        inst_bge,  
+        inst_bltu, 
+        inst_bgeu, 
+        inst_jal,  
+        inst_jalr,  
+        pre_taken, pre_target, pre_index,
+        imm_B, imm_J, imm_I
     };
-//位宽: 32 + 12 + 1 + 1 + 1 + 1 + 4 + 1 + 5 + 32 + 32 + 32 +8 = 162
+//位宽: 32 + 12 + 1 + 1 + 1 + 1 + 4 + 1 + 5 + 32 + 32 + 32 +8+ 8+1+32+6+96 = 305
 
+
+    /*...........output bus to if stage (RAS 维护).............*/
+    wire is_link_reg_rd  = (rd == 5'd1) || (rd == 5'd5);
+    wire is_link_reg_rs1 = (rs1 == 5'd1) || (rs1 == 5'd5);
+    
+    // RAS 进栈条件：是函数调用指令call（jal 或 jalr，且目的寄存器rd是 x1 或 x5），且这是一条有效的指令
+    wire id_push_ras = (inst_jal || inst_jalr) && is_link_reg_rd && id_valid  && !flush_en;
+    
+    // RAS 出栈条件：是函数返回指令ret (jalr，源寄存器rs1是 x1 或 x5），且 rd != rs1，且这是一条有效的指令
+    wire id_pop_ras  = inst_jalr && is_link_reg_rs1 && (rd != rs1) && id_valid && !flush_en;
+    
+    // RAS 入栈数据：函数调用指令的下一条指令地址 (PC + 4)
+    wire [31:0] id_ras_wdata = id_pc + 32'h4;
+
+    // 打包送往 IF 级
+    assign id_to_if_bus = {id_push_ras, id_pop_ras, id_ras_wdata};
 
     /*..................internal signals................*/
 
@@ -193,15 +228,15 @@ module id_stage(
     assign inst_sh  = op_STORE  & (funct3 == 3'b001); // 新增
     assign inst_sw  = op_STORE  & (funct3 == 3'b010);
     // B型：条件分支
-    wire inst_beq   = op_BRANCH & (funct3 == 3'b000);
-    wire inst_bne   = op_BRANCH & (funct3 == 3'b001);
-    wire inst_blt   = op_BRANCH & (funct3 == 3'b100); // 新增
-    wire inst_bge   = op_BRANCH & (funct3 == 3'b101); // 新增
-    wire inst_bltu  = op_BRANCH & (funct3 == 3'b110); // 新增
-    wire inst_bgeu  = op_BRANCH & (funct3 == 3'b111); // 新增
+    assign inst_beq   = op_BRANCH & (funct3 == 3'b000);
+    assign inst_bne   = op_BRANCH & (funct3 == 3'b001);
+    assign inst_blt   = op_BRANCH & (funct3 == 3'b100); 
+    assign inst_bge   = op_BRANCH & (funct3 == 3'b101); 
+    assign inst_bltu  = op_BRANCH & (funct3 == 3'b110); 
+    assign inst_bgeu  = op_BRANCH & (funct3 == 3'b111); 
     //J型 & I型：无条件跳转
-    wire inst_jal   = op_JAL;
-    wire inst_jalr  = op_JALR   & (funct3 == 3'b000);
+    assign inst_jal   = op_JAL;
+    assign inst_jalr  = op_JALR   & (funct3 == 3'b000);
     //U型：长立即数
     wire inst_lui   = op_LUI;
     wire inst_auipc = op_AUIPC; // 新增
@@ -278,30 +313,6 @@ module id_stage(
     //rs1_value和rs2_value的值要考虑前递的情况，具体实现在后面
 
 
-
-    //分支跳转br unit  
-    wire rs1_eq_rs2 = (rs1_value == rs2_value);
-    // 新增：提取判断条件给新型分支指令用
-    wire rs1_l_rs2  = ($signed(rs1_value) < $signed(rs2_value));     // blt
-    wire rs1_lu_rs2 = (rs1_value < rs2_value);                       // bltu
-    
-    // 判断是否分支发生 (修改：增加大小相关的分支判定)
-    assign br_taken = (  (inst_beq  && rs1_eq_rs2)
-                      || (inst_bne  && !rs1_eq_rs2)
-                      || (inst_blt  && rs1_l_rs2)
-                      || (inst_bge  && !rs1_l_rs2)
-                      || (inst_bltu && rs1_lu_rs2)
-                      || (inst_bgeu && !rs1_lu_rs2)
-                      || op_JAL
-                      || op_JALR 
-                      ) && id_valid;
-
-    // 分支目标地址计算
-    // JALR是寄存器相对跳转(需要把计算结果的第0位设为0)；B和J都是PC相对跳转
-    assign br_target = (op_BRANCH) ? (id_pc + imm_B) :
-                       (op_JAL)    ? (id_pc + imm_J) :
-                       (op_JALR)   ? ((rs1_value + imm_I) & ~32'b1) : 
-                       32'b0;
 
     // mem+wb 信号生成
     assign mem_en       = op_LOAD | op_STORE;
@@ -382,7 +393,8 @@ module id_stage(
     */
 
 
-    assign br_cancel = id_valid && br_taken && id_ready_go;
+    
+    
     /*我要产生一个信号 br_cancel，用来在时钟上升沿把 ID 阶段清空为气泡（id_valid <= 0）
     1、什么时候应该清空 ID？
     肯定是当目前 ID 阶段的指令是一条分支指令，并且它算出了真正要跳（br_taken = 1）。

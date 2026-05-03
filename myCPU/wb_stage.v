@@ -11,7 +11,8 @@ module wb_stage(
     output wire [31:0] debug_wb_pc,
     output wire [3:0]  debug_wb_rf_we,
     output wire [4:0]  debug_wb_rf_wnum,
-    output wire [31:0] debug_wb_rf_wdata
+    output wire [31:0] debug_wb_rf_wdata,
+    output wire        debug_wb_valid
 
 );
     
@@ -72,7 +73,7 @@ module wb_stage(
     assign debug_wb_rf_we   = {4{wb_reg_we & wb_valid}};//★为什么加上wb_valid？为什么debug_wb_rf_wen是4位的？32位的数据包含了 4个字节。为了方便调试，Trace测试平台要求你的CPU交代得非常详细：你到底写了这32位数据里面的哪几个字节
     assign debug_wb_rf_wnum = wb_reg_waddr;  //写了哪个寄存器(写地址)
     assign debug_wb_rf_wdata = wb_final_result;
-   
+    assign debug_wb_valid = wb_valid;
 
 
 /*具体写回的操作已经在ID阶段的寄存器堆那里实现了，这里就不需要再写了，直接把要写回的数据通过总线传回ID阶段就行了

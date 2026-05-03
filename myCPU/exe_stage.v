@@ -5,6 +5,7 @@ module exe_stage(
     
     input  wire [`ID_TO_EXE_BUS_WIDTH-1:0] id_to_exe_bus,              
     output wire [`EXE_TO_MEM_BUS_WIDTH-1:0] exe_to_mem_bus,
+    output wire [`EXE_TO_IF_BUS_WIDTH-1:0] exe_to_if_bus, //bus to IF stage (for branch)
     output wire [`EXE_TO_ID_BYPASS_BUS_WIDTH-1:0] exe_to_id_bypass_bus, //bus to ID stage for bypass
 
     input wire id_to_exe_valid, 
@@ -62,6 +63,20 @@ module exe_stage(
     wire        inst_sh;
     wire        inst_sw;
 
+    wire        inst_beq;
+    wire        inst_bne;
+    wire        inst_blt;
+    wire        inst_bge;
+    wire        inst_bltu;
+    wire        inst_bgeu;
+    wire        inst_jal;
+    wire        inst_jalr;
+    wire        pre_taken;
+    wire [31:0] pre_target;
+    wire [5:0]  pre_index;
+    wire [31:0] imm_B;
+    wire [31:0] imm_J;
+    wire [31:0] imm_I;
     reg [`ID_TO_EXE_BUS_WIDTH-1:0] exe_reg;
 
     always @(posedge clk) begin
@@ -83,6 +98,7 @@ module exe_stage(
             exe_rs1_value,   //32
             exe_rs2_value,  //32
             exe_imm,         //32
+
             inst_lb,         //1
             inst_lh,         //1
             inst_lw,         //1
@@ -90,9 +106,47 @@ module exe_stage(
             inst_lhu,        //1
             inst_sb,         //1
             inst_sh,         //1
-            inst_sw          //1
+            inst_sw,          //1
+
+            inst_beq,         //1
+            inst_bne,         //1
+            inst_blt,         //1
+            inst_bge,         //1
+            inst_bltu,        //1
+            inst_bgeu,        //1
+            inst_jal,         //1
+            inst_jalr,        //1
+            pre_taken,        //1
+            pre_target,       //32
+            pre_index,         //6
+            imm_B,            //32
+            imm_J,            //32
+            imm_I             //32
         } = exe_reg;
     
+
+    //output bus to if stage 
+    wire flush_en;                  // 1
+    wire [31:0] exe_target;       // 32
+    wire exe_we;                    // 1
+    wire [14:0] exe_tag;            // 15
+    wire exe_taken;                 // 1
+    wire exe_is_ret;                // 1   
+
+    assign exe_to_if_bus={
+        flush_en,
+        exe_target,
+        exe_we,
+        pre_index,
+        exe_tag,
+        exe_taken,
+        exe_is_ret
+    };
+    //位宽是1+32+1+6+15+1+1=57
+
+    //output bus to id stage
+
+
     //output bus to mem stage    
     wire [31:0] alu_result;
     assign exe_to_mem_bus = {
@@ -113,7 +167,8 @@ module exe_stage(
         exe_reg_we, 
         exe_reg_waddr, 
         alu_result,
-        exe_is_load 
+        exe_is_load,
+        flush_en 
     };
     //位宽是1+1+5+32+1=40
 
@@ -133,6 +188,43 @@ module exe_stage(
         .alu_src2   (alu_src2  ),
         .alu_result (alu_result)
         );
+
+    
+    /*分支跳转br unit*/ 
+    wire rs1_eq_rs2 = (exe_rs1_value == exe_rs2_value);
+    // 新增：提取判断条件给新型分支指令用
+    wire rs1_l_rs2  = ($signed(exe_rs1_value) < $signed(exe_rs2_value));     // blt
+    wire rs1_lu_rs2 = (exe_rs1_value < exe_rs2_value);                       // bltu
+    
+    // 判断是否分支发生 (修改：增加大小相关的分支判定)
+    assign exe_taken = (  (inst_beq  && rs1_eq_rs2)
+                      || (inst_bne  && !rs1_eq_rs2)
+                      || (inst_blt  && rs1_l_rs2)
+                      || (inst_bge  && !rs1_l_rs2)
+                      || (inst_bltu && rs1_lu_rs2)
+                      || (inst_bgeu && !rs1_lu_rs2)
+                      || inst_jal
+                      || inst_jalr
+                      ) && exe_valid;
+
+   
+      
+    // 分支目标地址计算
+    wire [31:0] br_target = (inst_beq | inst_bne | inst_blt | inst_bge | inst_bltu | inst_bgeu) ? (exe_pc + imm_B) :
+                     (inst_jal)    ? (exe_pc + imm_J) :
+                     (inst_jalr)   ? ((exe_rs1_value + imm_I) & ~32'b1) : 
+                      32'b0;    
+    assign exe_target = exe_taken ? br_target : (exe_pc + 32'h4);
+
+    assign flush_en = ((exe_taken != pre_taken) || (exe_taken && (br_target != pre_target)))
+                      && exe_valid;   
+    assign exe_we = (inst_beq | inst_bne | inst_blt | inst_bge | inst_bltu | inst_bgeu | inst_jal | inst_jalr)
+                                  && exe_valid;
+
+    assign exe_tag      = exe_pc[22:8]; 
+    assign exe_is_ret = inst_jalr && (exe_reg_waddr == 5'b0); 
+    //这一大段代码什么意思，详细解释一下？
+
 
     // 修改：数据存储器 根据指令要求完成写掩码和移位
     wire [3:0] st_data_byte_en;

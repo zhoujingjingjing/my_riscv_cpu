@@ -88,8 +88,10 @@ module mem_stage(
     wire [31:0] mem_result;
 
     // 修改：根据 Load 类型对齐取出所需字节，并做对应符号/零扩展
-    wire [7:0] rdata_byte = (inst_lb | inst_lbu) ? (data_sram_rdata >> (mem_alu_result[1:0] * 8 )) : 8'b0;
-    wire [15:0] rdata_half= (inst_lh | inst_lhu) ? (data_sram_rdata >> (mem_alu_result[1]   * 16)) : 16'b0;
+    wire [31:0] rdata_byte_shifted = data_sram_rdata >> (mem_alu_result[1:0] * 8);
+    wire [31:0] rdata_half_shifted = data_sram_rdata >> (mem_alu_result[1]   * 16);
+    wire [7:0]  rdata_byte = (inst_lb | inst_lbu) ? rdata_byte_shifted[7:0]   : 8'b0;
+    wire [15:0] rdata_half = (inst_lh | inst_lhu) ? rdata_half_shifted[15:0]  : 16'b0;
     /*提取阶段：利用地址的低两位 mem_alu_result[1:0]。
     如果地址低两位是 2'b01，对于按字节读（lb/lbu），1 * 8 = 8，则将整个 32 位数据右移 8 位。此时原本在 [15:8] 的有用字节被移到了 [7:0] 的位置。然后截取最低 8 位赋给 rdata_byte。
     对于半字读（lh/lhu），只看地址的第 1 位（0 或 1）。如果是 1，1 * 16 = 16，原数据右移 16 位，高半字落入低半字位置。
