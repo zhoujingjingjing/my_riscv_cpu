@@ -53,6 +53,27 @@ module perip_bridge(
     logic [31:0] seg_wdata, cnt_rdata, mmio_rdata, dram_rdata;
     logic [39:0] seg_output;
 
+    // 新增：用于防亚稳态的两级同步寄存器 (运行在 180MHz clk)
+    logic [63:0] virtual_sw_sync1, virtual_sw_sync2;
+    logic [7:0]  virtual_key_sync1, virtual_key_sync2;
+
+    // 新增：2-Stage DFF 消除亚稳态
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            virtual_sw_sync1  <= 64'd0;
+            virtual_sw_sync2  <= 64'd0;
+            virtual_key_sync1 <= 8'd0;
+            virtual_key_sync2 <= 8'd0;
+        end else begin
+            // 第一拍：可能产生亚稳态
+            virtual_sw_sync1  <= virtual_sw_input;
+            virtual_key_sync1 <= virtual_key_input;
+            // 第二拍：亚稳态基本消除，这组信号可以安全给下面逻辑使用
+            virtual_sw_sync2  <= virtual_sw_sync1;
+            virtual_key_sync2 <= virtual_key_sync1;
+        end
+    end
+
     // 2. 写入路由器：CPU写数据时的数据流向
     // 对照文档要求：外设区域只能4字节对齐访问，所以注释写了 we don't care perip_mask，因为对这里的硬件读写总是整个 32 位一起操作的。
     // we don't care perip_mask in LED, SEG, SW & KEY, only care in DRAM
@@ -87,11 +108,11 @@ module perip_bridge(
             case (perip_addr_read)
                 // 巧妙的数据切分：文档说 SW 有 64 位，但 32 位 CPU 一次只能读 32 位。
                 // 所以访问 0x00 给你低 32 位，访问 0x04 (+4字节的位置) 给你高 32 位。
-                SW0_ADDR:  mmio_rdata = virtual_sw_input[31:0];
-                SW1_ADDR:  mmio_rdata = virtual_sw_input[63:32];
+                SW0_ADDR:  mmio_rdata = virtual_sw_sync2[31:0];
+                SW1_ADDR:  mmio_rdata = virtual_sw_sync2[63:32];
                 
                 // KEY只有8位，剩下24位补0
-                KEY_ADDR:  mmio_rdata = {24'd0, virtual_key_input};
+                KEY_ADDR:  mmio_rdata = {24'd0, virtual_key_sync2};
                 
                 // 读数码管当前的显示数值 (读写属性)
                 SEG_ADDR:  mmio_rdata = seg_wdata; 
@@ -140,7 +161,7 @@ module perip_bridge(
 
     // counter rw (挂载计时器)
     counter counter_inst (
-        .clk				(cnt_clk),
+        .clk				(clk),
         .rst                (rst),
         .perip_wdata		(perip_wdata),
         // 同理，只有地址完美等于 0x8020_0050 且有写使能，定时器才会理会 CPU 发来的打火/熄火命令。

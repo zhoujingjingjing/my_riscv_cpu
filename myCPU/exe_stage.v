@@ -5,6 +5,7 @@ module exe_stage(
     
     input  wire [`ID_TO_EXE_BUS_WIDTH-1:0] id_to_exe_bus,              
     output wire [`EXE_TO_MEM_BUS_WIDTH-1:0] exe_to_mem_bus,
+    output wire [`EXE_TO_IF_BUS_WIDTH-1:0] exe_to_if_bus, //bus to IF stage (for branch)
     output wire [`EXE_TO_ID_BYPASS_BUS_WIDTH-1:0] exe_to_id_bypass_bus, //bus to ID stage for bypass
 
     input wire id_to_exe_valid, 
@@ -12,6 +13,11 @@ module exe_stage(
     output wire exe_allow_in, 
     output wire exe_to_mem_valid,
 
+    // [新增] CSR 当前读出值（组合输入，用于计算 csr_wdata）
+    // csr_addr 已在 id_to_exe_bus 里，top 层用 wb_csr_addr 驱动 CSR 模块的读地址。
+    // 但 EXE 级需要用 csr_rvalue 来计算 csrrs/csrrc 的写入值。
+    // 为避免时序问题，csr_rvalue 在 EXE 级作为组合输入直接使用。
+    input  wire [31:0] csr_rvalue,
          
     output wire       data_sram_en,
     output wire [3:0] data_sram_we,
@@ -62,6 +68,32 @@ module exe_stage(
     wire        inst_sh;
     wire        inst_sw;
 
+    wire        inst_beq;
+    wire        inst_bne;
+    wire        inst_blt;
+    wire        inst_bge;
+    wire        inst_bltu;
+    wire        inst_bgeu;
+    wire        inst_jal;
+    wire        inst_jalr;
+    wire        pre_taken;
+    wire [31:0] pre_target;
+    wire [5:0]  pre_index;
+    wire [31:0] imm_B;
+    wire [31:0] imm_J;
+    wire [31:0] imm_I;
+    wire        exe_is_ret_from_id;
+    wire [2:0]  exe_safe_ras_ptr;
+
+    // [新增] CSR 相关字段
+    wire exe_inst_ecall, exe_inst_mret;
+    wire exe_inst_csrrw, exe_inst_csrrs, exe_inst_csrrc;
+    wire exe_inst_csrrwi, exe_inst_csrrsi, exe_inst_csrrci;
+    wire [11:0] exe_csr_addr;
+    wire [4:0]  exe_csr_uimm;
+    wire        exe_is_csr_inst;
+
+
     reg [`ID_TO_EXE_BUS_WIDTH-1:0] exe_reg;
 
     always @(posedge clk) begin
@@ -83,6 +115,7 @@ module exe_stage(
             exe_rs1_value,   //32
             exe_rs2_value,  //32
             exe_imm,         //32
+
             inst_lb,         //1
             inst_lh,         //1
             inst_lw,         //1
@@ -90,9 +123,90 @@ module exe_stage(
             inst_lhu,        //1
             inst_sb,         //1
             inst_sh,         //1
-            inst_sw          //1
+            inst_sw,          //1
+
+            inst_beq,         //1
+            inst_bne,         //1
+            inst_blt,         //1
+            inst_bge,         //1
+            inst_bltu,        //1
+            inst_bgeu,        //1
+            inst_jal,         //1
+            inst_jalr,        //1
+            pre_taken,        //1
+            pre_target,       //32
+            pre_index,         //6
+            imm_B,            //32
+            imm_J,            //32
+            imm_I,            //32
+            exe_is_ret_from_id,   //1
+            exe_safe_ras_ptr,       //3
+
+            // [新增] CSR 字段
+            exe_inst_ecall, exe_inst_mret,
+            exe_inst_csrrw, exe_inst_csrrs, exe_inst_csrrc,
+            exe_inst_csrrwi, exe_inst_csrrsi, exe_inst_csrrci,
+            exe_csr_addr,
+            exe_csr_uimm,
+            exe_is_csr_inst
         } = exe_reg;
     
+
+    //output bus to if stage 
+    wire flush_en;                  // 1
+    wire [31:0] exe_target;       // 32
+    wire exe_we;                    // 1
+    wire [14:0] exe_tag;            // 15
+    wire exe_taken;                 // 1
+    wire exe_is_ret;                // 1   
+
+    assign exe_to_if_bus={
+        flush_en,
+        exe_target,
+        exe_we,
+        pre_index,
+        exe_tag,
+        exe_taken,
+        exe_is_ret,
+        exe_safe_ras_ptr
+    };
+    //位宽是1+32+1+6+15+1+1 +3 =60
+
+
+
+
+    // ================================================================
+    // [新增] CSR 写入值计算（在 EXE 级算好，通过总线传至 WB 级执行写操作）
+    //
+    // 之所以在 EXE 级算而不在 WB 级算：
+    //   - EXE 级有 rs1_value（已过旁路），WB 级不再有 rs1_value。
+    //   - csr_rvalue 在 EXE 级就能读到（CSR 是异步读），不需要等到 WB。
+    //   - 这样 EXE→MEM→WB 只需透传算好的 csr_wdata，路径短，时序好。
+    //
+    // 三种操作：
+    //   csrrw/csrrwi : csr_wdata = rs1_value（或 uimm），全量写入
+    //   csrrs/csrrsi : csr_wdata = csr_rvalue | rs1_value（置位）
+    //   csrrc/csrrci : csr_wdata = csr_rvalue & ~rs1_value（清位）
+    // ================================================================
+    wire [31:0] csr_op_src; // csrrw用rs1，csrrwi用uimm（零扩展到32位）
+    wire is_csr_imm = exe_inst_csrrwi | exe_inst_csrrsi | exe_inst_csrrci;
+    assign csr_op_src = is_csr_imm ? {27'b0, exe_csr_uimm} : exe_rs1_value;
+ 
+    wire [31:0] exe_csr_wdata;
+    assign exe_csr_wdata =
+        (exe_inst_csrrw  | exe_inst_csrrwi) ? csr_op_src                        :   // 全量写
+        (exe_inst_csrrs  | exe_inst_csrrsi) ? (csr_rvalue | csr_op_src)         :   // 置位
+        (exe_inst_csrrc  | exe_inst_csrrci) ? (csr_rvalue & ~csr_op_src)        :   // 清位
+        32'b0;
+ 
+    // CSR 写使能：csrrs/csrrc 当 src=0 时不写（只读）
+    wire exe_csr_we = exe_valid && (
+        exe_inst_csrrw  | exe_inst_csrrwi |                                 // csrrw 始终写
+        (exe_inst_csrrs  | exe_inst_csrrsi) && (csr_op_src != 32'b0) |     // csrrs: src!=0 才写
+        (exe_inst_csrrc  | exe_inst_csrrci) && (csr_op_src != 32'b0)       // csrrc: src!=0 才写
+    );
+
+
     //output bus to mem stage    
     wire [31:0] alu_result;
     assign exe_to_mem_bus = {
@@ -102,9 +216,19 @@ module exe_stage(
             exe_reg_we,     
             exe_reg_waddr,  
             // 修改：只需要将 load 信号向后传，store不需要
-            inst_lb, inst_lh, inst_lw, inst_lbu, inst_lhu
+            inst_lb, inst_lh, inst_lw, inst_lbu, inst_lhu,
+
+            // [新增] CSR 相关透传字段（供 WB 级使用）
+            exe_inst_ecall,   // 1
+            exe_inst_mret,    // 1
+            exe_csr_we,       // 1  (已算好的CSR写使能)
+            exe_csr_addr,     // 12
+            exe_csr_wdata,    // 32
+            exe_is_csr_inst   // 1
+            // 合计新增 48 位
     };
     //位宽是32+32+1+1+5+5=76
+    //  76 + 48 = 124
 
     //output bus to id stage for bypass
     wire exe_is_load = exe_mem_en && (exe_mem_we == 4'b0000);//判断exe阶段的这条指令是不是ld.w指令，特征是使能内存但不写内存（exe_mem_en 区分访存指令和其他指令，exe_mem_we==4'b0000是为了区分ld.w和st.w）
@@ -113,7 +237,8 @@ module exe_stage(
         exe_reg_we, 
         exe_reg_waddr, 
         alu_result,
-        exe_is_load 
+        exe_is_load,
+        flush_en 
     };
     //位宽是1+1+5+32+1=40
 
@@ -133,6 +258,47 @@ module exe_stage(
         .alu_src2   (alu_src2  ),
         .alu_result (alu_result)
         );
+
+    
+    /*分支跳转br unit*/ 
+    wire rs1_eq_rs2 = (exe_rs1_value == exe_rs2_value);
+    // 新增：提取判断条件给新型分支指令用
+    wire rs1_l_rs2  = ($signed(exe_rs1_value) < $signed(exe_rs2_value));     // blt
+    wire rs1_lu_rs2 = (exe_rs1_value < exe_rs2_value);                       // bltu
+    
+    // 判断是否分支发生 (修改：增加大小相关的分支判定)
+    assign exe_taken = (  (inst_beq  && rs1_eq_rs2)
+                      || (inst_bne  && !rs1_eq_rs2)
+                      || (inst_blt  && rs1_l_rs2)
+                      || (inst_bge  && !rs1_l_rs2)
+                      || (inst_bltu && rs1_lu_rs2)
+                      || (inst_bgeu && !rs1_lu_rs2)
+                      || inst_jal
+                      || inst_jalr
+                      ) && exe_valid;
+                      // [注意] ecall/mret 不触发 EXE 级的 flush_en
+                      // 它们的 PC 重定向由 WB 级的 wb_ex/mret_flush 处理
+   
+      
+    // 分支目标地址计算
+    wire [31:0] br_target = (inst_beq | inst_bne | inst_blt | inst_bge | inst_bltu | inst_bgeu) ? (exe_pc + imm_B) :
+                     (inst_jal)    ? (exe_pc + imm_J) :
+                     (inst_jalr)   ? ((exe_rs1_value + imm_I) & ~32'b1) : 
+                      32'b0;    
+    assign exe_target = exe_taken ? br_target : (exe_pc + 32'h4);
+
+    assign flush_en = ((exe_taken != pre_taken) || (exe_taken && (br_target != pre_target)))
+                      && exe_valid;   
+
+    // [注意] BTB 更新：ecall/mret/CSR 指令不更新 BTB，也不进行动态分支预测
+    // exe_we 只在真正的分支/跳转指令上置1
+    assign exe_we = (inst_beq | inst_bne | inst_blt | inst_bge | inst_bltu | inst_bgeu | inst_jal | inst_jalr)
+                                  && exe_valid && exe_ready_go;
+
+    assign exe_tag      = exe_pc[22:8]; 
+    assign exe_is_ret = exe_is_ret_from_id;
+
+
 
     // 修改：数据存储器 根据指令要求完成写掩码和移位
     wire [3:0] st_data_byte_en;
