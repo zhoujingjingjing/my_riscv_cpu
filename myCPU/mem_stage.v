@@ -47,6 +47,14 @@ module mem_stage(
     wire        inst_lbu;
     wire        inst_lhu;
 
+    // [新增] CSR 透传字段
+    wire        mem_inst_ecall;
+    wire        mem_inst_mret;
+    wire        mem_csr_we;
+    wire [11:0] mem_csr_addr;
+    wire [31:0] mem_csr_wdata;
+    wire        mem_is_csr_inst;
+
     reg [`EXE_TO_MEM_BUS_WIDTH-1:0] mem_reg;
 
     always @(posedge clk) begin
@@ -61,7 +69,14 @@ module mem_stage(
         mem_res_from_mem,    
         mem_reg_we,     
         mem_reg_waddr,  
-        inst_lb, inst_lh, inst_lw, inst_lbu, inst_lhu
+        inst_lb, inst_lh, inst_lw, inst_lbu, inst_lhu,
+        // [新增]
+        mem_inst_ecall,
+        mem_inst_mret,
+        mem_csr_we,
+        mem_csr_addr,
+        mem_csr_wdata,
+        mem_is_csr_inst
     } = mem_reg;
 
     //output bus to wb stage
@@ -70,10 +85,18 @@ module mem_stage(
         mem_pc,
         final_result,
         mem_reg_we,
-        mem_reg_waddr
+        mem_reg_waddr,
+        // [新增] 透传给 WB
+        mem_inst_ecall,
+        mem_inst_mret,
+        mem_csr_we,
+        mem_csr_addr,
+        mem_csr_wdata,
+        mem_is_csr_inst
+
     };
    //位宽是32+32+1+5=70
-
+    // 70 + 48 = 118
 
     //output bus to id stage for bypass
     assign mem_to_id_bypass_bus = {

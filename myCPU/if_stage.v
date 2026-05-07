@@ -12,6 +12,13 @@ module if_stage (
     output wire if_to_id_valid,
     input  wire id_allow_in, 
 
+    
+    // [新增] 来自 WB 级的异常/mret 冲刷信号
+    input  wire        wb_ex,        // WB级有异常，冲刷流水线并跳向异常入口
+    input  wire [31:0] ex_entry,     // 异常入口地址（来自CSR mtvec）
+    input  wire        mret_flush,   // WB级 mret 执行，冲刷并跳向 mepc
+    input  wire [31:0] csr_mepc_out, // mepc（来自CSR模块）
+
     output wire        inst_sram_en,
     output wire  [3:0] inst_sram_we,//写使能改为4位
     output wire [31:0] inst_sram_addr,
@@ -20,19 +27,10 @@ module if_stage (
 );
 
 
-// output bus to ID stage
-    reg  [31:0] if_pc;
-    wire [31:0] inst;
 
-    wire        pre_taken;
-    wire [31:0] pre_target;
-    wire [5:0]  pre_index;
-    wire        pre_is_ret;
-    assign if_to_id_bus = {if_pc, inst, pre_taken, pre_target, pre_index, current_ras_ptr};
-    //位宽: 32 + 32 + 1 + 32 + 6 += 106
 
     // input bus from EXE (for branch flush and BTB update)
-    wire        flush_en;
+    wire        flush_en;  // EXE级分支预测错误冲刷
     wire        exe_we;  
     wire [5:0]  exe_index; 
     wire [14:0] exe_tag;
@@ -51,7 +49,16 @@ module if_stage (
     wire [31:0] id_ras_wdata;
     assign {id_push_ras, id_pop_ras, id_ras_wdata} = id_to_if_bus;
 
+    // output bus to ID stage
+    reg  [31:0] if_pc;
+    wire [31:0] inst;
 
+    wire        pre_taken;
+    wire [31:0] pre_target;
+    wire [5:0]  pre_index;
+    wire        pre_is_ret;
+    assign if_to_id_bus = {if_pc, inst, pre_taken, pre_target, pre_index, current_ras_ptr};
+    //位宽: 32 + 32 + 1 + 32 + 6 += 106
 
 // BTB 预测模块实例化 
 btb # (
@@ -90,20 +97,29 @@ btb # (
     /*......pipeline control.......*/
 
 
+    // [修改] nextpc 优先级：wb_ex（异常）> mret_flush（异常返回）> flush_en（分支预测错误）> BTB预测 > 顺序
+    // wb_ex 和 mret_flush 都属于"WB级确定的控制流改变"，优先级最高
+    // 注意：wb_ex 和 mret_flush 理论上不会同时为1（mret本身若有异常走wb_ex路径）
     wire [31:0] seq_pc;
     wire [31:0] nextpc;
-    assign seq_pc       = if_pc + 32'h4;
-    assign nextpc = flush_en  ? exe_target : 
-                    pre_taken ? pre_target : 
-                                seq_pc;//这段代码什么意思？
+    assign seq_pc  = if_pc + 32'h4;
+    assign nextpc  = wb_ex      ? ex_entry      :   // 异常：跳向 mtvec
+                     mret_flush ? csr_mepc_out  :   // mret：跳向 mepc
+                     flush_en   ? exe_target    :   // 分支预测失败：修正
+                     pre_taken  ? pre_target    :   // BTB预测跳转
+                                  seq_pc;           // 顺序执行
+ 
+    // [修改] wb_flush = wb_ex || mret_flush，用于冲刷 IF 级
+    wire wb_flush = wb_ex || mret_flush;
    
 
     wire if_allow_in;
     wire if_ready_go;
     reg if_valid;
 
-    assign if_to_id_valid = if_valid && if_ready_go && !flush_en;
-    assign if_allow_in = !if_valid || (if_ready_go && id_allow_in)|| flush_en;//这里加flush_en干什么？
+    // wb_flush 时 IF 级输出无效（正在重定向，取到的指令作废）
+    assign if_to_id_valid = if_valid && if_ready_go && !flush_en && !wb_flush;
+    assign if_allow_in = !if_valid || (if_ready_go && id_allow_in)|| flush_en || wb_flush;
     assign if_ready_go   = 1'b1;
 
     always @(posedge clk) begin
