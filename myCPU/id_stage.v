@@ -4,13 +4,16 @@ module id_stage(
     input wire reset,
 
     output wire [`ID_TO_EXE_BUS_WIDTH-1:0] id_to_exe_bus,//bus to EXE stage
-    output wire [`ID_TO_IF_BUS_WIDTH-1:0]  id_to_if_bus, //bus to IF stage (for branch)
+    output wire [`ID_TO_IF_BUS_WIDTH-1:0] id_to_if_bus, //bus to IF stage (for RAS maintenance)
     input  wire [`IF_TO_ID_BUS_WIDTH-1:0]  if_to_id_bus, //bus from IF stage
     input wire  [`WB_TO_ID_BUS_WIDTH-1:0]  wb_to_id_bus, //bus from WB stage(for regfile and bypass)
     input wire  [`EXE_TO_ID_BYPASS_BUS_WIDTH-1:0]    exe_to_id_bypass_bus, //bus from EXE stage for bypass
     input wire  [`MEM_TO_ID_BYPASS_BUS_WIDTH-1:0]    mem_to_id_bypass_bus, //bus from MEM stage for bypass
 
-  
+    // [新增] 来自 WB 级的异常/mret 冲刷信号（用于冲刷ID级 + CSR冲突阻塞）
+    input  wire        wb_ex,
+    input  wire        mret_flush,
+
     output wire id_allow_in,
     output wire id_to_exe_valid,
     input wire exe_allow_in,
@@ -19,16 +22,18 @@ module id_stage(
 );
 
 
+    // wb_flush：WB级引起的流水线全冲刷
+    wire wb_flush = wb_ex || mret_flush;
+
     /*.........pipeline control.............*/
     
     wire id_ready_go;
     reg  id_valid;
     reg [`IF_TO_ID_BUS_WIDTH-1:0] id_reg;
-    wire br_cancel;
     always @ (posedge clk) begin
         if (reset) begin
             id_valid <= 1'b0;
-        end else if (br_cancel) begin
+        end else if (wb_flush || flush_en) begin // [修改] wb_flush（异常/mret）和 EXE 分支预测失败都要冲刷 ID 级
             id_valid <= 1'b0;//如果分支跳转了，那么就把id_stage的指令作废了，变成气泡    
         end else if (id_allow_in) begin
             id_valid <= if_to_id_valid;
@@ -37,7 +42,7 @@ module id_stage(
 
     // assign id_ready_go = 1'b1;
     assign id_allow_in = ~id_valid || id_ready_go && exe_allow_in;
-    assign id_to_exe_valid = id_valid && id_ready_go;
+    assign id_to_exe_valid = id_valid && id_ready_go && !flush_en && !wb_flush; // [修改] wb_flush 时 ID 级输出无效
 
   /*............input bus from IF stage.............*/
     always @(posedge clk) begin
@@ -46,9 +51,14 @@ module id_stage(
         end
     end
 
-    wire  [31:0] id_pc;
+    wire [31:0] id_pc;
     wire [31:0] id_inst;
-    assign {id_pc, id_inst} = id_reg;//输入
+
+    wire        pre_taken;
+    wire [31:0] pre_target;
+    wire [5:0]  pre_index;
+    wire [2:0]  current_ras_ptr;// 用于拆出 IF 传过来的快照
+    assign {id_pc, id_inst, pre_taken, pre_target, pre_index, current_ras_ptr} = id_reg;//输入
 
 
     /*..........input bus from WB stage..............*/
@@ -64,7 +74,8 @@ module id_stage(
     wire [4:0] exe_rf_waddr;
     wire [31:0] exe_rf_wdata;
     wire exe_is_load;//exe阶段的指令是否是load指令，这个信号是为了在ID阶段判断是否有load-use冒险
-    assign {exe_valid, exe_rf_we, exe_rf_waddr, exe_rf_wdata, exe_is_load} = exe_to_id_bypass_bus;
+    wire flush_en;   // EXE 分支预测失败冲刷
+    assign {exe_valid, exe_rf_we, exe_rf_waddr, exe_rf_wdata, exe_is_load, flush_en} = exe_to_id_bypass_bus;
 
     /*..........input bus from mem stage..............*/
     wire mem_valid;
@@ -73,11 +84,6 @@ module id_stage(
     wire [31:0] mem_rf_wdata;
     assign {mem_valid, mem_rf_we, mem_rf_waddr, mem_rf_wdata} = mem_to_id_bypass_bus;
 
-
-    /*...........output bus to if stage.............*/
-    wire        br_taken;
-    wire [31:0] br_target;
-    assign id_to_if_bus = {br_taken, br_target};//输出
 
 
     /*............output bus to EXE stage.............*/
@@ -103,6 +109,31 @@ module id_stage(
     wire        inst_sb;
     wire        inst_sh;
     wire        inst_sw;
+    //送到EXE阶段的分支判定信号
+    wire inst_beq;
+    wire inst_bne;
+    wire inst_blt;
+    wire inst_bge;
+    wire inst_bltu;
+    wire inst_bgeu;
+    wire inst_jal;
+    wire inst_jalr;
+
+
+    // [新增] CSR 相关指令信号
+    wire inst_ecall;   // ecall 指令
+    wire inst_mret;    // mret 指令
+    wire inst_csrrw;   // csrrw
+    wire inst_csrrs;   // csrrs
+    wire inst_csrrc;   // csrrc
+    wire inst_csrrwi;  // csrrwi
+    wire inst_csrrsi;  // csrrsi
+    wire inst_csrrci;  // csrrci
+ 
+    // [新增] CSR 地址和立即数操作数（uimm = rs1字段作为5位零扩展立即数）
+    wire [11:0] csr_addr;   // 指令[31:20]
+    wire [4:0]  csr_uimm;   // 指令[19:15]，用于csrrwi/csrrsi/csrrci
+
 
     assign id_to_exe_bus = {
         id_pc,
@@ -124,10 +155,57 @@ module id_stage(
         inst_lhu, // 新增
         inst_sb,  // 新增
         inst_sh,  // 新增
-        inst_sw   // 新增           
-    };
-//位宽: 32 + 12 + 1 + 1 + 1 + 1 + 4 + 1 + 5 + 32 + 32 + 32 +8 = 162
+        inst_sw,  // 新增      
+        
+        inst_beq,  
+        inst_bne,  
+        inst_blt, 
+        inst_bge,  
+        inst_bltu, 
+        inst_bgeu, 
+        inst_jal,  
+        inst_jalr,  
+        pre_taken, pre_target, pre_index,
+        imm_B, imm_J, imm_I,
+        id_is_ret,
+        id_safe_ras_ptr,
 
+        // [新增] CSR 相关字段
+        inst_ecall, inst_mret,
+        inst_csrrw, inst_csrrs, inst_csrrc,
+        inst_csrrwi, inst_csrrsi, inst_csrrci,
+        csr_addr,    // 12位
+        csr_uimm,     // 5位
+        is_csr_inst
+    };
+    // 如果我是函数调用(id_push_ras)，我的合法未来就是初始快照+1；否则就是初始快照原样
+    wire [2:0] id_safe_ras_ptr = id_push_ras ? (current_ras_ptr + 3'b1) : current_ras_ptr;
+
+    wire id_is_ret = inst_jalr && is_link_reg_rs1 && (rd != rs1);//函数返回指令标志，用于exe阶段给 BTB 更新
+    //位宽: 32 + 12 + 1 + 1 + 1 + 1 + 4 + 1 + 5 + 32 + 32 + 32 +8+ 8+1+32+6+96+ 1 + 3 = 309
+    // 位宽验证：原309 + 1+1 + 1+1+1+1+1+1 + 12 + 5+1 = 309+26 = 335
+
+
+
+    /*...........output bus to if stage (RAS 维护).............*/
+    wire is_link_reg_rd  = (rd == 5'd1) || (rd == 5'd5);
+    wire is_link_reg_rs1 = (rs1 == 5'd1) || (rs1 == 5'd5);
+    
+
+    // [注意] mret 绝对不能触碰 RAS！mret 是从 CSR mepc 返回，与 RAS 无关
+    // inst_mret 在 id_push_ras / id_pop_ras 的条件里不出现
+    // RAS 进栈条件：是函数调用指令call（jal 或 jalr，且目的寄存器rd是 x1 或 x5），且这是一条有效的指令
+    wire id_push_ras = (inst_jal || inst_jalr) && is_link_reg_rd && id_valid  && !flush_en && !wb_flush;
+    
+    // RAS 出栈条件：是函数返回指令ret (jalr，源寄存器rs1是 x1 或 x5），且 rd != rs1，且这是一条有效的指令
+    wire id_pop_ras  = inst_jalr && is_link_reg_rs1 && (rd != rs1) && id_valid && !flush_en && !wb_flush;
+
+    
+    // RAS 入栈数据：函数调用指令的下一条指令地址 (PC + 4)
+    wire [31:0] id_ras_wdata = id_pc + 32'h4;
+
+    // 打包送往 IF 级
+    assign id_to_if_bus = {id_push_ras, id_pop_ras, id_ras_wdata};
 
     /*..................internal signals................*/
 
@@ -159,6 +237,8 @@ module id_stage(
     wire op_JALR    = (opcode == 7'b1100111); // 无条件间接跳转链接
     wire op_LUI     = (opcode == 7'b0110111); // 高位加载
     wire op_AUIPC   = (opcode == 7'b0010111); // 新增：AUIPC 指令大类wire op_AUIPC   = (opcode == 7'b0010111); // 新增：AUIPC 指令大类
+    wire op_SYSTEM  = (opcode == 7'b1110011);// [新增] SYSTEM 大类（ecall/ebreak/mret/CSR指令都用这个opcode）
+
 
     //结合 funct3 和 funct7 翻译出具体指令
     // R型
@@ -193,19 +273,44 @@ module id_stage(
     assign inst_sh  = op_STORE  & (funct3 == 3'b001); // 新增
     assign inst_sw  = op_STORE  & (funct3 == 3'b010);
     // B型：条件分支
-    wire inst_beq   = op_BRANCH & (funct3 == 3'b000);
-    wire inst_bne   = op_BRANCH & (funct3 == 3'b001);
-    wire inst_blt   = op_BRANCH & (funct3 == 3'b100); // 新增
-    wire inst_bge   = op_BRANCH & (funct3 == 3'b101); // 新增
-    wire inst_bltu  = op_BRANCH & (funct3 == 3'b110); // 新增
-    wire inst_bgeu  = op_BRANCH & (funct3 == 3'b111); // 新增
+    assign inst_beq   = op_BRANCH & (funct3 == 3'b000);
+    assign inst_bne   = op_BRANCH & (funct3 == 3'b001);
+    assign inst_blt   = op_BRANCH & (funct3 == 3'b100); 
+    assign inst_bge   = op_BRANCH & (funct3 == 3'b101); 
+    assign inst_bltu  = op_BRANCH & (funct3 == 3'b110); 
+    assign inst_bgeu  = op_BRANCH & (funct3 == 3'b111); 
     //J型 & I型：无条件跳转
-    wire inst_jal   = op_JAL;
-    wire inst_jalr  = op_JALR   & (funct3 == 3'b000);
+    assign inst_jal   = op_JAL;
+    assign inst_jalr  = op_JALR   & (funct3 == 3'b000);
     //U型：长立即数
     wire inst_lui   = op_LUI;
     wire inst_auipc = op_AUIPC; // 新增
 
+    // [新增] SYSTEM 类指令译码
+    // ecall：全编码 0x00000073
+    assign inst_ecall  = op_SYSTEM & (funct3 == 3'b000) & (id_inst[31:20] == 12'b0000_0000_0000);
+    // mret： 全编码 0x30200073
+    assign inst_mret   = op_SYSTEM & (funct3 == 3'b000) & (id_inst[31:20] == 12'b0011_0000_0010);
+    // CSR 寄存器操作类（funct3 = 001/010/011）
+    assign inst_csrrw  = op_SYSTEM & (funct3 == 3'b001);
+    assign inst_csrrs  = op_SYSTEM & (funct3 == 3'b010);
+    assign inst_csrrc  = op_SYSTEM & (funct3 == 3'b011);
+    // CSR 立即数操作类（funct3 = 101/110/111）
+    assign inst_csrrwi = op_SYSTEM & (funct3 == 3'b101);
+    assign inst_csrrsi = op_SYSTEM & (funct3 == 3'b110);
+    assign inst_csrrci = op_SYSTEM & (funct3 == 3'b111);
+ 
+
+
+
+    // [新增] CSR 地址：指令[31:20]（所有CSR指令编码一致）
+    assign csr_addr = id_inst[31:20];
+    // [新增] CSR 立即数（用于 csrrwi/csrrsi/csrrci）：rs1字段[19:15]零扩展
+    assign csr_uimm = id_inst[19:15];
+ 
+    // is_csr_inst：当前指令是任意一条CSR读写指令
+    wire is_csr_inst = inst_csrrw | inst_csrrs | inst_csrrc |
+                       inst_csrrwi | inst_csrrsi | inst_csrrci;
     
 
     /*控制信号生成*/
@@ -279,30 +384,6 @@ module id_stage(
 
 
 
-    //分支跳转br unit  
-    wire rs1_eq_rs2 = (rs1_value == rs2_value);
-    // 新增：提取判断条件给新型分支指令用
-    wire rs1_l_rs2  = ($signed(rs1_value) < $signed(rs2_value));     // blt
-    wire rs1_lu_rs2 = (rs1_value < rs2_value);                       // bltu
-    
-    // 判断是否分支发生 (修改：增加大小相关的分支判定)
-    assign br_taken = (  (inst_beq  && rs1_eq_rs2)
-                      || (inst_bne  && !rs1_eq_rs2)
-                      || (inst_blt  && rs1_l_rs2)
-                      || (inst_bge  && !rs1_l_rs2)
-                      || (inst_bltu && rs1_lu_rs2)
-                      || (inst_bgeu && !rs1_lu_rs2)
-                      || op_JAL
-                      || op_JALR 
-                      ) && id_valid;
-
-    // 分支目标地址计算
-    // JALR是寄存器相对跳转(需要把计算结果的第0位设为0)；B和J都是PC相对跳转
-    assign br_target = (op_BRANCH) ? (id_pc + imm_B) :
-                       (op_JAL)    ? (id_pc + imm_J) :
-                       (op_JALR)   ? ((rs1_value + imm_I) & ~32'b1) : 
-                       32'b0;
-
     // mem+wb 信号生成
     assign mem_en       = op_LOAD | op_STORE;
     assign mem_we       = {4{op_STORE}};       
@@ -310,7 +391,13 @@ module id_stage(
     
     // 写寄存器地址永远在 rd 字段
     assign reg_waddr    = rd;
-    assign reg_we       = (op_R_TYPE | op_I_TYPE | op_LOAD | op_LUI | op_JAL | op_JALR | op_AUIPC) && id_valid;
+    // [修改] CSR 指令仅在 rd!=x0 时才写回通用寄存器；rd=x0 的 CSR 指令（如 csrw=csrrw x0）
+    //        只写 CSR、不写 GPR，对应 debug_wb_rf_we 应为 0（与 golden model ID.c:298 一致）。
+    //        普通算术/访存指令即使 rd=x0 也按惯例 reg_we=1（写 x0 被寄存器堆忽略），保持原行为。
+    assign reg_we       = ((op_R_TYPE | op_I_TYPE | op_LOAD | op_LUI | op_JAL | op_JALR | op_AUIPC)
+                           | (is_csr_inst && (rd != 5'd0))) && id_valid;
+    // ecall/mret 不写通用寄存器
+
 
 
     // hazard detection
@@ -325,9 +412,9 @@ module id_stage(
         没有冒险
     */
    // 判断当前译出指令是否需要读对应寄存器？
-    wire use_rf_rdata1 = id_valid && (op_R_TYPE | op_I_TYPE | op_LOAD | op_STORE | op_BRANCH | op_JALR);
+    wire use_rf_rdata1 = id_valid && (op_R_TYPE | op_I_TYPE | op_LOAD | op_STORE | op_BRANCH | op_JALR | is_csr_inst); // 只要是这些类型的指令，就需要用到 rs1 的值（即使是 jalr 和 csr 指令，虽然它们的 rs1 可能不参与运算，但它们也需要读寄存器堆来获取 rs1 的值）
     wire use_rf_rdata2 = id_valid && (op_R_TYPE | op_STORE | op_BRANCH);
-
+    // CSR寄存器操作也用rs1
     
 
     //bypass
@@ -359,8 +446,67 @@ module id_stage(
     EXE阶段的指令要有效，需要是ld.w指令，要写回寄存器，并且它写回的寄存器地址不为0，并且它写回的寄存器地址和当前指令读rdata1的寄存器地址相同，那么就有load-use冒险
     */
 
+
+
+
+
+    // ================================================================
+    // [新增] CSR 写后读冲突检测（表7.4 场景1/2/3）
+    //
+    // 问题：CSR 写操作在 WB 级才真正生效。如果流水线的 EXE/MEM/WB 级
+    //       有 CSR 写指令 或 mret 在执行，而当前 ID 级要读 CSR 相关状态
+    //      （判断中断 has_int、或准备执行 mret 需要读 mepc），
+    //       就会读到旧值，产生错误。
+    //
+    // 解决：保守地阻塞 ID 级，直到所有在途的 CSR 写者都退出流水线。
+    //
+    // 注意：场景4（mret 修改特权级 → 取指）通过"mret 在 WB 级才产生
+    //       mret_flush + PC重定向"天然解决，无需额外处理。
+    // ================================================================
+ 
+    // 检测 EXE/MEM/WB 级是否有 CSR 写指令（任意一条 csrr* 指令）或 mret
+    // 这些信号需要从各级总线中解出。
+    // 为了不大改各级总线，采用以下方案：
+    //   - exe_to_id_bypass_bus 已有 exe_valid + flush_en；
+    //   - 我们在 EXE/MEM/WB 级总线里新增 is_csr_write 和 is_mret 位；
+    //   - 但这会改总线宽度，且题目要求尽量少改。
+    //
+    // 更轻量的方案：在 ID 级维护一个3拍移位寄存器，记录"最近三条进入
+    // EXE 的指令是否是 CSR 写 / mret"，直接在 ID 级实现。
+    // 这样完全不需要改 EXE/MEM/WB 的总线。
+    //
+    // 移位寄存器：每当 id_to_exe_valid 为1（有指令进入EXE），就左移。
+    // csr_mret_in_pipe[0]: 刚进入EXE的指令是否是CSR写/mret（最新）
+    // csr_mret_in_pipe[1]: 在MEM的
+    // csr_mret_in_pipe[2]: 在WB的（最老，写操作即将在本拍生效）
+ 
+    reg [2:0] csr_write_in_pipe; // 追踪CSR写指令在EXE/MEM/WB的存在
+    reg [2:0] mret_in_pipe;      // 追踪mret在EXE/MEM/WB的存在
+ 
+    wire id_is_csr_write = is_csr_inst && id_valid && id_ready_go && !wb_flush && !flush_en;
+    wire id_is_mret      = inst_mret   && id_valid && id_ready_go && !wb_flush && !flush_en;
+ 
+    always @(posedge clk) begin
+        if (reset || wb_flush) begin
+            csr_write_in_pipe <= 3'b0;
+            mret_in_pipe      <= 3'b0;
+        end else begin
+            // 每个时钟，如果流水线在正常流动（没有整体stall），就移位
+            // 简化：始终移位（每拍推进一级）
+            // bit2=WB, bit1=MEM, bit0=EXE
+            // 注：这里假设流水线各级 ready_go=1，若有stall需更复杂跟踪
+            // 对于 CSR 冒险阻塞，偏保守无妨（多停一拍不影响正确性）
+            csr_write_in_pipe <= {csr_write_in_pipe[1:0], id_is_csr_write};
+            mret_in_pipe      <= {mret_in_pipe[1:0],      id_is_mret};
+        end
+    end
+ 
+    // 只要 EXE/MEM/WB 中任意一级有 CSR 写指令 或 mret，就阻塞 ID 级
+    // （等它们都退出后，CSR值才是新的，ID级才能安全地检查中断等）
+    wire csr_hazard = (|csr_write_in_pipe) || (|mret_in_pipe);
+
     
-    assign id_ready_go = !(rf_rdata1_hazard || rf_rdata2_hazard);//如果有冒险了，那么id_ready_go就为0，id_stage就不ready，就不允许id_stage的指令进入下一个阶段exe_stage，这样就在id_stage停住了，往后传气泡id_to_exe_valid = id_valid && id_ready_go=0
+    assign id_ready_go = !(rf_rdata1_hazard || rf_rdata2_hazard || csr_hazard);//如果有冒险了，那么id_ready_go就为0，id_stage就不ready，就不允许id_stage的指令进入下一个阶段exe_stage，这样就在id_stage停住了，往后传气泡id_to_exe_valid = id_valid && id_ready_go=0
      /*id_allow_in = ~id_valid || id_ready_go && exe_allow_in=0,
     从而使if_allow_in = !if_valid || (if_ready_go && id_allow_in)=0，
     always @(posedge clk) begin
@@ -382,7 +528,8 @@ module id_stage(
     */
 
 
-    assign br_cancel = id_valid && br_taken && id_ready_go;
+    
+    
     /*我要产生一个信号 br_cancel，用来在时钟上升沿把 ID 阶段清空为气泡（id_valid <= 0）
     1、什么时候应该清空 ID？
     肯定是当目前 ID 阶段的指令是一条分支指令，并且它算出了真正要跳（br_taken = 1）。

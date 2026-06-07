@@ -85,7 +85,7 @@ module student_top#(
 
     // 16KB = 2^12 * 32bit
     // 实例化 BRAM IP 核替换原来的 IROM
-    inst_ram Mem_IROM (
+    inst_ram Mem_IRAM (
         .clka  (w_cpu_clk         ),
         .ena   (inst_en           ),
         .wea   (inst_we           ),
