@@ -7,25 +7,36 @@ module mem_stage(
     output wire [`MEM_TO_WB_BUS_WIDTH-1:0] mem_to_wb_bus,
     output wire [`MEM_TO_ID_BYPASS_BUS_WIDTH-1:0] mem_to_id_bypass_bus, //bus to ID stage for bypass
 
-    input wire  exe_to_mem_valid, 
-    input wire  wb_allow_in, 
-    output wire mem_allow_in, 
+    input wire  exe_to_mem_valid,
+    input wire  wb_allow_in,
+    output wire mem_allow_in,
     output wire mem_to_wb_valid,
 
+    // [新增] 异常/mret 冲刷信号：ecall/mret 在 WB 级触发时，MEM 级里更年轻的
+    //        指令必须一起作废，否则会错误提交 ecall/mret 后面的指令。
+    input wire  wb_ex,
+    input wire  mret_flush,
+
     input wire [31:0] data_sram_rdata //读内存数据
-   
+
 );
     
     //pipeline control 
     reg         mem_valid;
     wire        mem_ready_go;
 
+    // [新增] WB 级异常/mret 冲刷：作废 MEM 级当前指令
+    wire wb_flush = wb_ex || mret_flush;
+
     assign mem_ready_go    = 1'b1;
     assign mem_allow_in    = !mem_valid||( mem_ready_go && wb_allow_in) ;
-    assign mem_to_wb_valid   = mem_valid && mem_ready_go;   
-    
+    assign mem_to_wb_valid   = mem_valid && mem_ready_go && !wb_flush; // [修改] 冲刷时本拍输出也作废
+
     always@(posedge clk) begin
         if(reset) begin
+            mem_valid <= 1'b0;
+        end
+        else if(wb_flush) begin     // [新增] 异常/mret 时冲刷 MEM 级（优先于正常推进）
             mem_valid <= 1'b0;
         end
         else if(mem_allow_in) begin
@@ -47,6 +58,14 @@ module mem_stage(
     wire        inst_lbu;
     wire        inst_lhu;
 
+    // [新增] CSR 透传字段
+    wire        mem_inst_ecall;
+    wire        mem_inst_mret;
+    wire        mem_csr_we;
+    wire [11:0] mem_csr_addr;
+    wire [31:0] mem_csr_wdata;
+    wire        mem_is_csr_inst;
+
     reg [`EXE_TO_MEM_BUS_WIDTH-1:0] mem_reg;
 
     always @(posedge clk) begin
@@ -61,7 +80,14 @@ module mem_stage(
         mem_res_from_mem,    
         mem_reg_we,     
         mem_reg_waddr,  
-        inst_lb, inst_lh, inst_lw, inst_lbu, inst_lhu
+        inst_lb, inst_lh, inst_lw, inst_lbu, inst_lhu,
+        // [新增]
+        mem_inst_ecall,
+        mem_inst_mret,
+        mem_csr_we,
+        mem_csr_addr,
+        mem_csr_wdata,
+        mem_is_csr_inst
     } = mem_reg;
 
     //output bus to wb stage
@@ -70,10 +96,18 @@ module mem_stage(
         mem_pc,
         final_result,
         mem_reg_we,
-        mem_reg_waddr
+        mem_reg_waddr,
+        // [新增] 透传给 WB
+        mem_inst_ecall,
+        mem_inst_mret,
+        mem_csr_we,
+        mem_csr_addr,
+        mem_csr_wdata,
+        mem_is_csr_inst
+
     };
    //位宽是32+32+1+5=70
-
+    // 70 + 48 = 118
 
     //output bus to id stage for bypass
     assign mem_to_id_bypass_bus = {
@@ -88,8 +122,10 @@ module mem_stage(
     wire [31:0] mem_result;
 
     // 修改：根据 Load 类型对齐取出所需字节，并做对应符号/零扩展
-    wire [7:0] rdata_byte = (inst_lb | inst_lbu) ? (data_sram_rdata >> (mem_alu_result[1:0] * 8 )) : 8'b0;
-    wire [15:0] rdata_half= (inst_lh | inst_lhu) ? (data_sram_rdata >> (mem_alu_result[1]   * 16)) : 16'b0;
+    wire [31:0] rdata_byte_shifted = data_sram_rdata >> (mem_alu_result[1:0] * 8);
+    wire [31:0] rdata_half_shifted = data_sram_rdata >> (mem_alu_result[1]   * 16);
+    wire [7:0]  rdata_byte = (inst_lb | inst_lbu) ? rdata_byte_shifted[7:0]   : 8'b0;
+    wire [15:0] rdata_half = (inst_lh | inst_lhu) ? rdata_half_shifted[15:0]  : 16'b0;
     /*提取阶段：利用地址的低两位 mem_alu_result[1:0]。
     如果地址低两位是 2'b01，对于按字节读（lb/lbu），1 * 8 = 8，则将整个 32 位数据右移 8 位。此时原本在 [15:8] 的有用字节被移到了 [7:0] 的位置。然后截取最低 8 位赋给 rdata_byte。
     对于半字读（lh/lhu），只看地址的第 1 位（0 或 1）。如果是 1，1 * 16 = 16，原数据右移 16 位，高半字落入低半字位置。
